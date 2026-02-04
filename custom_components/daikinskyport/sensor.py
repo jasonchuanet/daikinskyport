@@ -6,6 +6,7 @@ from homeassistant.const import (
     CONCENTRATION_PARTS_PER_BILLION,
     CONCENTRATION_MICROGRAMS_PER_CUBIC_METER,
     UnitOfPower,
+    UnitOfEnergy,
     UnitOfVolumeFlowRate
 )
 from homeassistant.components.sensor import (
@@ -101,6 +102,12 @@ SENSOR_TYPES = {
         "state_class": SensorStateClass.MEASUREMENT,
         "icon": "mdi:lightning-bolt",
     },
+    "energy": {
+        "device_class": SensorDeviceClass.ENERGY,
+        "native_unit_of_measurement": UnitOfEnergy.WATT_HOUR,
+        "state_class": SensorStateClass.TOTAL_INCREASING,
+        "icon": "mdi:lightning-bolt",
+    },
     "frequency_percent": {
         "device_class": DEVICE_CLASS_FREQ_PERCENT,
         "native_unit_of_measurement": PERCENTAGE,
@@ -140,7 +147,7 @@ async def async_setup_entry(
         for sensor in sensors:
             if sensor["type"] not in ("temperature", "humidity", "score",
                                       "ozone", "particle", "VOC", "demand",
-                                      "power", "frequency_percent","actual_status",
+                                      "power", "energy", "frequency_percent","actual_status",
                                       "airflow", "fault_code") or sensor["value"] == 127.5 or sensor["value"] == 65535:
                 continue
             async_add_entities([DaikinSkyportSensor(coordinator, sensor["name"], sensor["type"], index)], True)

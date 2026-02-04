@@ -28,6 +28,8 @@ async def async_setup_entry(
 
     for index in range(len(coordinator.daikinskyport.thermostats)):
         thermostat = coordinator.daikinskyport.get_thermostat(index)
+        if thermostat.get("device_type") == "wall_unit" or thermostat.get("adptSupportedEquipment") == "RA" or "iduOperatingMode" in thermostat:
+            continue
         async_add_entities([DaikinSkyportAuxHeat(coordinator, thermostat["name"], index)], True)
 
 class DaikinSkyportAuxHeat(SwitchEntity):

@@ -43,6 +43,8 @@ async def async_setup_entry(
 
     for index in range(len(coordinator.daikinskyport.thermostats)):
         thermostat = coordinator.daikinskyport.get_thermostat(index)
+        if not any(key.startswith("weather") for key in thermostat):
+            continue
         async_add_entities([DaikinSkyportWeather(coordinator, thermostat["name"], index)], True)
 
 class DaikinSkyportWeather(WeatherEntity):

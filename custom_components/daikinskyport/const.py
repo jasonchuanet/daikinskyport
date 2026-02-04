@@ -51,12 +51,17 @@ DAIKIN_WEATHER_ICON_TO_HASS = {
 # The multiplier applied by the API to percentage values.
 DAIKIN_PERCENT_MULTIPLIER = 2
 
-# Possible hvac modes are auto (3), auxHeatOnly (4), cool (2), heat (1), off (0) '''
+# Possible hvac modes are auto (3), auxHeatOnly (4), cool (2), heat (1), off (0), dry (5)
 DAIKIN_HVAC_MODE_OFF = 0
 DAIKIN_HVAC_MODE_HEAT = 1
 DAIKIN_HVAC_MODE_COOL = 2
 DAIKIN_HVAC_MODE_AUTO = 3
 DAIKIN_HVAC_MODE_AUXHEAT = 4
+DAIKIN_HVAC_MODE_DRY = 5
+
+# Wall-unit mini-split fan-only handling
+WALL_UNIT_FAN_MODE_DEFAULT = 0  # Canonical fan-only iduOperatingMode value
+WALL_UNIT_FAN_MODE_VALUES = {WALL_UNIT_FAN_MODE_DEFAULT}
 
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_ACCESS_TOKEN = "access_token"

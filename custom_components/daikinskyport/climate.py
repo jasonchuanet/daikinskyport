@@ -49,6 +49,9 @@ from .const import (
     DAIKIN_HVAC_MODE_COOL,
     DAIKIN_HVAC_MODE_AUTO,
     DAIKIN_HVAC_MODE_AUXHEAT,
+    DAIKIN_HVAC_MODE_DRY,
+    WALL_UNIT_FAN_MODE_DEFAULT,
+    WALL_UNIT_FAN_MODE_VALUES,
     COORDINATOR,
 )
 
@@ -66,6 +69,8 @@ PRESET_AWAY = "Away"
 PRESET_SCHEDULE = "Schedule"
 PRESET_MANUAL = "Manual"
 PRESET_TEMP_HOLD = "Temp Hold"
+PRESET_ECONO = "Econo"
+PRESET_BOOST = "Boost"
 FAN_SCHEDULE = "Schedule"
 
 #Fan Schedule values
@@ -102,6 +107,7 @@ DAIKIN_HVAC_TO_HASS = collections.OrderedDict(
         (DAIKIN_HVAC_MODE_HEAT, HVACMode.HEAT),
         (DAIKIN_HVAC_MODE_COOL, HVACMode.COOL),
         (DAIKIN_HVAC_MODE_AUTO, HVACMode.AUTO),
+        (DAIKIN_HVAC_MODE_DRY, HVACMode.DRY),
         (DAIKIN_HVAC_MODE_OFF, HVACMode.OFF),
         (DAIKIN_HVAC_MODE_AUXHEAT, HVACMode.HEAT),
     ]
@@ -145,6 +151,13 @@ DAIKIN_HVAC_ACTION_TO_HASS = {
     2: HVACAction.DRYING,
     5: HVACAction.IDLE,
 }
+
+def _is_wall_unit(thermostat: dict) -> bool:
+    return (
+        thermostat.get("device_type") == "wall_unit"
+        or thermostat.get("adptSupportedEquipment") == "RA"
+        or "iduOperatingMode" in thermostat
+    )
 
 PRESET_TO_DAIKIN_HOLD = {
     HOLD_NEXT_TRANSITION: 0,
@@ -221,6 +234,18 @@ SUPPORT_FLAGS = (
     | ClimateEntityFeature.TURN_ON
     | ClimateEntityFeature.TURN_OFF
 )
+
+WALL_UNIT_FAN_SPEED_TO_HASS = {
+    10: "auto",
+    11: "quiet",
+    3: "low",
+    4: "medium_low",
+    5: "medium",
+    6: "medium_high",
+    7: "high",
+}
+WALL_UNIT_FAN_SPEED_ORDER = [10, 11, 3, 4, 5, 6, 7]
+WALL_UNIT_FAN_SPEED_FROM_HASS = {value: key for key, value in WALL_UNIT_FAN_SPEED_TO_HASS.items()}
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
@@ -401,42 +426,220 @@ class Thermostat(ClimateEntity):
         self.data = data
         self.thermostat_index = thermostat_index
         self.thermostat = thermostat
+        self._is_wall_unit = _is_wall_unit(self.thermostat)
         self._name = self.thermostat["name"]
         self._attr_unique_id = f"{self.thermostat['id']}-climate"
-        self._cool_setpoint = self.thermostat["cspActive"]
-        self._heat_setpoint = self.thermostat["hspActive"]
-        self._hvac_mode = DAIKIN_HVAC_TO_HASS[self.thermostat["mode"]]
-        if DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]] == FAN_ON:
-            self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculateSpeed"] + 3]
+        self._cool_setpoint = None
+        self._heat_setpoint = None
+        self._target_temp = None
+        self._hvac_mode = HVACMode.OFF
+        self._fan_mode = None
+        self._fan_speed = None
+        self._base_supported_features = SUPPORT_FLAGS
+        self._supported_features = SUPPORT_FLAGS
+        self._operation_list = []
+        self._preset_modes = set()
+        self._fan_modes = []
+        self.update_without_throttle = False
+        self._configure_capabilities()
+        self._apply_thermostat_state()
+
+    def _configure_capabilities(self) -> None:
+        if self._is_wall_unit:
+            self._base_supported_features = (
+                ClimateEntityFeature.TARGET_TEMPERATURE
+                | ClimateEntityFeature.FAN_MODE
+                | ClimateEntityFeature.PRESET_MODE
+            )
+            self._supported_features = self._base_supported_features
+            self._attr_precision = PRECISION_HALVES
+            self._operation_list = self._build_wall_unit_operation_list()
+            self._preset_modes = {
+                PRESET_ECONO,
+                PRESET_NONE,
+            }
+            if "oduPowerfulOperationRequest" in self.thermostat:
+                self._preset_modes.add(PRESET_BOOST)
+            self._fan_modes = []
         else:
-            self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]]
-        self._fan_speed = DAIKIN_FAN_SPEED_TO_HASS[self.thermostat["fanCirculateSpeed"]]
-        if self.thermostat["geofencingAway"]:
+            self._base_supported_features = SUPPORT_FLAGS
+            self._supported_features = self._base_supported_features
+            self._attr_precision = PRECISION_TENTHS
+            self._operation_list = []
+            if self.thermostat.get("ctSystemCapHeat"):
+                self._operation_list.append(HVACMode.HEAT)
+            if (("ctOutdoorNoofCoolStages" in self.thermostat and self.thermostat["ctOutdoorNoofCoolStages"] > 0)
+            or  ("P1P2S21CoolingCapability" in self.thermostat and self.thermostat["P1P2S21CoolingCapability"] is True)):
+                self._operation_list.append(HVACMode.COOL)
+            if len(self._operation_list) == 2:
+                self._operation_list.insert(0, HVACMode.AUTO)
+            self._operation_list.append(HVACMode.OFF)
+            self._preset_modes = {
+                PRESET_SCHEDULE,
+                PRESET_MANUAL,
+                PRESET_TEMP_HOLD,
+                PRESET_AWAY,
+            }
+            self._fan_modes = [FAN_AUTO, FAN_ON, FAN_LOW, FAN_MEDIUM, FAN_HIGH, FAN_SCHEDULE]
+
+    def _is_dry_mode(self) -> bool:
+        return self.hvac_mode == HVACMode.DRY
+
+    def _refresh_supported_features_for_mode(self) -> None:
+        """Adjust supported features based on the active HVAC mode."""
+        self._supported_features = self._base_supported_features
+        if not self._fan_modes:
+            self._supported_features &= ~ClimateEntityFeature.FAN_MODE
+        if self._is_wall_unit and self._is_dry_mode():
+            self._supported_features &= ~ClimateEntityFeature.TARGET_TEMPERATURE
+            self._supported_features &= ~ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
+            self._supported_features &= ~ClimateEntityFeature.FAN_MODE
+
+    def _build_wall_unit_operation_list(self) -> list[HVACMode]:
+        modes: list[HVACMode] = []
+        if "iduHeatSetpoint" in self.thermostat:
+            modes.append(HVACMode.HEAT)
+        if "iduCoolSetpoint" in self.thermostat:
+            modes.append(HVACMode.COOL)
+        if "iduAutoSetpoint" in self.thermostat:
+            modes.insert(0, HVACMode.AUTO)
+        if "iduDryFanSpeed" in self.thermostat or self.thermostat.get("iduOperatingMode") == 5:
+            modes.append(HVACMode.DRY)
+        if (
+            "iduFanModeFanSpeed" in self.thermostat
+            or self.thermostat.get("iduOperatingMode") in WALL_UNIT_FAN_MODE_VALUES
+        ):
+            modes.append(HVACMode.FAN_ONLY)
+        if HVACMode.OFF not in modes:
+            modes.append(HVACMode.OFF)
+        return modes
+
+    def _wall_unit_hvac_mode(self) -> HVACMode:
+        daikin_mode = self.thermostat.get("mode")
+        if daikin_mode is None:
+            daikin_mode = self.thermostat.get("iduOperatingMode")
+        if self.thermostat.get("iduOnOff") is False:
+            return HVACMode.OFF
+        if daikin_mode in WALL_UNIT_FAN_MODE_VALUES:
+            return HVACMode.FAN_ONLY
+        return DAIKIN_HVAC_TO_HASS.get(daikin_mode, HVACMode.OFF)
+
+    def _wall_unit_operating_mode(self) -> HVACMode | None:
+        op_mode = self.thermostat.get("iduOperatingMode")
+        if op_mode in WALL_UNIT_FAN_MODE_VALUES:
+            return HVACMode.FAN_ONLY
+        if op_mode == 1:
+            return HVACMode.HEAT
+        if op_mode == 2:
+            return HVACMode.COOL
+        if op_mode == 3:
+            return HVACMode.AUTO
+        if op_mode == 5:
+            return HVACMode.DRY
+        return None
+
+    def _wall_unit_fan_speed_key(self, hvac_mode: HVACMode) -> str | None:
+        return {
+            HVACMode.HEAT: "iduHeatFanSpeed",
+            HVACMode.COOL: "iduCoolFanSpeed",
+            HVACMode.AUTO: "iduAutoFanSpeed",
+            HVACMode.DRY: "iduDryFanSpeed",
+            HVACMode.FAN_ONLY: "iduFanModeFanSpeed",
+        }.get(hvac_mode)
+
+    def _wall_unit_fan_speed(self) -> int | None:
+        hvac_mode = self.hvac_mode
+        if hvac_mode == HVACMode.OFF:
+            hvac_mode = self._wall_unit_operating_mode()
+        if hvac_mode is None:
+            return None
+        fan_key = self._wall_unit_fan_speed_key(hvac_mode)
+        if fan_key is None:
+            return None
+        return self.thermostat.get(fan_key)
+
+    def _apply_thermostat_state(self) -> None:
+        if self._is_wall_unit:
+            self._hvac_mode = self._wall_unit_hvac_mode()
+            self._cool_setpoint = self.thermostat.get("iduCoolSetpoint", self.thermostat.get("cspActive"))
+            self._heat_setpoint = self.thermostat.get("iduHeatSetpoint", self.thermostat.get("hspActive"))
+            self._target_temp = self.thermostat.get("iduTargetTemp")
+            if self._target_temp is None:
+                if self._hvac_mode == HVACMode.HEAT:
+                    self._target_temp = self._heat_setpoint
+                elif self._hvac_mode == HVACMode.COOL:
+                    self._target_temp = self._cool_setpoint
+                else:
+                    self._target_temp = self.thermostat.get("iduAutoSetpoint", self._cool_setpoint or self._heat_setpoint)
+            if self.thermostat.get("oduPowerfulOperationRequest"):
+                self._preset_mode = PRESET_BOOST
+            elif self.thermostat.get("iduEconoModeSetting"):
+                self._preset_mode = PRESET_ECONO
+            else:
+                self._preset_mode = PRESET_NONE
+            fan_speed = self._wall_unit_fan_speed()
+            if fan_speed is not None:
+                self._fan_mode = WALL_UNIT_FAN_SPEED_TO_HASS.get(fan_speed, str(fan_speed))
+            else:
+                self._fan_mode = None
+            fan_values: list[int] = []
+            for key in (
+                "iduHeatFanSpeed",
+                "iduCoolFanSpeed",
+                "iduAutoFanSpeed",
+                "iduDryFanSpeed",
+                "iduFanModeFanSpeed",
+            ):
+                value = self.thermostat.get(key)
+                if isinstance(value, (int, float)):
+                    fan_values.append(value)
+            fan_values_set = set(int(value) for value in fan_values)
+            fan_modes: list[str] = []
+            if "iduFanModeFanSpeed" in self.thermostat:
+                fan_modes = [WALL_UNIT_FAN_SPEED_TO_HASS[value] for value in WALL_UNIT_FAN_SPEED_ORDER]
+            else:
+                for value in WALL_UNIT_FAN_SPEED_ORDER:
+                    if value in fan_values_set:
+                        fan_modes.append(WALL_UNIT_FAN_SPEED_TO_HASS.get(value, str(value)))
+            unknown_values = sorted(v for v in fan_values_set if v not in WALL_UNIT_FAN_SPEED_TO_HASS)
+            fan_modes.extend(str(value) for value in unknown_values)
+            self._fan_modes = fan_modes
+            if self._is_dry_mode():
+                self._fan_modes = []
+                self._fan_mode = None
+            self._refresh_supported_features_for_mode()
+            self._fan_speed = None
+            return
+
+        self._cool_setpoint = self.thermostat.get("cspActive")
+        self._heat_setpoint = self.thermostat.get("hspActive")
+        daikin_mode = self.thermostat.get("mode", DAIKIN_HVAC_MODE_OFF)
+        self._hvac_mode = DAIKIN_HVAC_TO_HASS.get(daikin_mode, HVACMode.OFF)
+        fan_circulate = self.thermostat.get("fanCirculate", 0)
+        fan_speed = self.thermostat.get("fanCirculateSpeed", 0)
+        if DAIKIN_FAN_TO_HASS.get(fan_circulate) == FAN_ON:
+            self._fan_mode = DAIKIN_FAN_TO_HASS.get(fan_speed + 3, FAN_ON)
+        else:
+            self._fan_mode = DAIKIN_FAN_TO_HASS.get(fan_circulate, FAN_AUTO)
+        self._fan_speed = DAIKIN_FAN_SPEED_TO_HASS.get(fan_speed, FAN_LOW)
+        if self.thermostat.get("geofencingAway"):
             self._preset_mode = PRESET_AWAY
-        elif self.thermostat["schedOverride"] == 1:
+        elif self.thermostat.get("schedOverride") == 1:
             self._preset_mode = PRESET_TEMP_HOLD
-        elif self.thermostat["schedEnabled"]:
+        elif self.thermostat.get("schedEnabled"):
             self._preset_mode = PRESET_SCHEDULE
         else:
             self._preset_mode = PRESET_MANUAL
+        if self._is_wall_unit and self._is_dry_mode():
+            self._fan_mode = None
+            self._fan_speed = None
+        self._refresh_supported_features_for_mode()
 
-        self._operation_list = []
-        if self.thermostat["ctSystemCapHeat"]:
-            self._operation_list.append(HVACMode.HEAT)
-        if (("ctOutdoorNoofCoolStages" in self.thermostat and self.thermostat["ctOutdoorNoofCoolStages"] > 0)
-        or  ("P1P2S21CoolingCapability" in self.thermostat and self.thermostat["P1P2S21CoolingCapability"] == True)):
-            self._operation_list.append(HVACMode.COOL)
-        if len(self._operation_list) == 2:
-            self._operation_list.insert(0, HVACMode.AUTO)
-        self._operation_list.append(HVACMode.OFF)
-
-        self._preset_modes = {PRESET_SCHEDULE,
-                              PRESET_MANUAL,
-                              PRESET_TEMP_HOLD,
-                              PRESET_AWAY
-                              }
-        self._fan_modes = [FAN_AUTO, FAN_ON, FAN_LOW, FAN_MEDIUM, FAN_HIGH, FAN_SCHEDULE]
-        self.update_without_throttle = False
+    def _daikin_mode_from_hass(self, hvac_mode: HVACMode) -> int:
+        return next(
+            (k for k, v in DAIKIN_HVAC_TO_HASS.items() if v == hvac_mode),
+            DAIKIN_HVAC_MODE_OFF,
+        )
 
     async def async_update(self):
         """Get the latest state from the thermostat."""
@@ -447,22 +650,9 @@ class Thermostat(ClimateEntity):
             await self.data._async_update_data()
 
         self.thermostat = self.data.daikinskyport.get_thermostat(self.thermostat_index)
-        self._cool_setpoint = self.thermostat["cspActive"]
-        self._heat_setpoint = self.thermostat["hspActive"]
-        self._hvac_mode = DAIKIN_HVAC_TO_HASS[self.thermostat["mode"]]
-        if DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]] == FAN_ON:
-            self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculateSpeed"] + 3]
-        else:
-            self._fan_mode = DAIKIN_FAN_TO_HASS[self.thermostat["fanCirculate"]]
-        self._fan_speed = DAIKIN_FAN_SPEED_TO_HASS[self.thermostat["fanCirculateSpeed"]]
-        if self.thermostat["geofencingAway"]:
-            self._preset_mode = PRESET_AWAY
-        elif self.thermostat["schedOverride"] == 1:
-            self._preset_mode = PRESET_TEMP_HOLD
-        elif self.thermostat["schedEnabled"]:
-            self._preset_mode = PRESET_SCHEDULE
-        else:
-            self._preset_mode = PRESET_MANUAL
+        self._is_wall_unit = _is_wall_unit(self.thermostat)
+        self._configure_capabilities()
+        self._apply_thermostat_state()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -476,7 +666,7 @@ class Thermostat(ClimateEntity):
     @property
     def supported_features(self):
         """Return the list of supported features."""
-        return SUPPORT_FLAGS
+        return self._supported_features
 
     @property
     def name(self):
@@ -486,11 +676,13 @@ class Thermostat(ClimateEntity):
     @property
     def current_temperature(self) -> float:
         """Return the current temperature."""
-        return self.thermostat["tempIndoor"]
+        return self.thermostat.get("tempIndoor", self.thermostat.get("iduRoomTemp"))
 
     @property
     def target_temperature_low(self):
         """Return the lower bound temperature we try to reach."""
+        if self._is_wall_unit:
+            return None
         if self.hvac_mode == HVACMode.AUTO:
             return self._heat_setpoint
         return None
@@ -498,6 +690,8 @@ class Thermostat(ClimateEntity):
     @property
     def target_temperature_high(self):
         """Return the upper bound temperature we try to reach."""
+        if self._is_wall_unit:
+            return None
         if self.hvac_mode == HVACMode.AUTO:
             return self._cool_setpoint
         return None
@@ -505,6 +699,10 @@ class Thermostat(ClimateEntity):
     @property
     def target_temperature(self):
         """Return the temperature we try to reach."""
+        if self._is_wall_unit:
+            if self._is_dry_mode():
+                return None
+            return self._target_temp
         if self.hvac_mode == HVACMode.AUTO:
             return None
         if self.hvac_mode == HVACMode.HEAT:
@@ -553,17 +751,43 @@ class Thermostat(ClimateEntity):
     @property
     def current_humidity(self) -> Optional[int]:
         """Return the current humidity."""
-        return self.thermostat["humIndoor"]
+        return self.thermostat.get("humIndoor")
 
     @property
     def hvac_action(self):
         """Return current HVAC action."""
-        return DAIKIN_HVAC_ACTION_TO_HASS[self.thermostat["equipmentStatus"]]
+        status = self.thermostat.get("equipmentStatus")
+        if status in DAIKIN_HVAC_ACTION_TO_HASS:
+            return DAIKIN_HVAC_ACTION_TO_HASS[status]
+        if self._is_wall_unit:
+            if self.hvac_mode == HVACMode.OFF or self.thermostat.get("iduOnOff") is False:
+                return HVACAction.OFF
+            if "iduThermoState" in self.thermostat:
+                if self.thermostat.get("iduThermoState") is False:
+                    return HVACAction.IDLE
+                if self.hvac_mode == HVACMode.HEAT:
+                    return HVACAction.HEATING
+                if self.hvac_mode == HVACMode.COOL:
+                    return HVACAction.COOLING
+                if self.hvac_mode == HVACMode.DRY:
+                    return HVACAction.DRYING
+                if self.hvac_mode == HVACMode.FAN_ONLY:
+                    return HVACAction.FAN
+                return HVACAction.IDLE
+            if self.hvac_mode == HVACMode.HEAT:
+                return HVACAction.HEATING
+            if self.hvac_mode == HVACMode.COOL:
+                return HVACAction.COOLING
+            if self.hvac_mode == HVACMode.DRY:
+                return HVACAction.DRYING
+            if self.hvac_mode == HVACMode.FAN_ONLY:
+                return HVACAction.FAN
+            return HVACAction.IDLE
+        return None
 
     @property
     def extra_state_attributes(self):
         """Return device specific state attributes."""
-        status = self.thermostat["equipmentStatus"]
         fan_cfm = "Unavailable"
         fan_demand = "Unavailable"
         cooling_demand = "Unavailable"
@@ -606,9 +830,9 @@ class Thermostat(ClimateEntity):
         if "ctOutdoorMode" in self.thermostat:
             outdoor_mode = self.thermostat["ctOutdoorMode"].strip()
 
-        return {
+        attributes = {
             "fan": self.fan,
-            "schedule_mode": self.thermostat["schedEnabled"],
+            "schedule_mode": self.thermostat.get("schedEnabled"),
             "fan_cfm": fan_cfm,
             "fan_demand": fan_demand,
             "cooling_demand": cooling_demand,
@@ -616,18 +840,66 @@ class Thermostat(ClimateEntity):
             "heatpump_demand": heatpump_demand,
             "dehumidification_demand": dehumidification_demand,
             "humidification_demand": humidification_demand,
-            "thermostat_version": self.thermostat["statFirmware"],
-            "night_mode_active": self.thermostat["nightModeActive"],
-            "night_mode_enabled": self.thermostat["nightModeEnabled"],
             "indoor_mode": indoor_mode,
             "outdoor_mode": outdoor_mode,
-            "thermostat_unlocked": bool(self.thermostat["displayLockPIN"] == 0),
-            "media_filter_days": self.thermostat["alertMediaAirFilterDays"]
         }
+
+        if "statFirmware" in self.thermostat:
+            attributes["thermostat_version"] = self.thermostat["statFirmware"]
+        if "nightModeActive" in self.thermostat:
+            attributes["night_mode_active"] = self.thermostat["nightModeActive"]
+        if "nightModeEnabled" in self.thermostat:
+            attributes["night_mode_enabled"] = self.thermostat["nightModeEnabled"]
+        if "displayLockPIN" in self.thermostat:
+            attributes["thermostat_unlocked"] = bool(self.thermostat["displayLockPIN"] == 0)
+        if "alertMediaAirFilterDays" in self.thermostat:
+            attributes["media_filter_days"] = self.thermostat["alertMediaAirFilterDays"]
+        if "iduEconoModeSetting" in self.thermostat:
+            attributes["econo_mode"] = self.thermostat["iduEconoModeSetting"]
+        if "oduPowerfulOperationRequest" in self.thermostat:
+            attributes["boost_mode"] = self.thermostat["oduPowerfulOperationRequest"]
+
+        if self._is_wall_unit:
+            if "iduOnOff" in self.thermostat:
+                attributes["idu_on"] = self.thermostat["iduOnOff"]
+            if "iduOperatingMode" in self.thermostat:
+                attributes["idu_operating_mode"] = self.thermostat["iduOperatingMode"]
+            if "iduTargetTemp" in self.thermostat:
+                attributes["idu_target_temp"] = self.thermostat["iduTargetTemp"]
+            if "iduDeltaDCommand" in self.thermostat:
+                attributes["idu_delta_d_command"] = self.thermostat["iduDeltaDCommand"]
+            if "oduOutdoorTemp" in self.thermostat:
+                attributes["odu_outdoor_temp"] = self.thermostat["oduOutdoorTemp"]
+            if "oduCompOnOff" in self.thermostat:
+                attributes["odu_comp_on"] = self.thermostat["oduCompOnOff"]
+            if "oduIntPowerConsumption" in self.thermostat:
+                attributes["odu_int_energy_wh"] = self.thermostat["oduIntPowerConsumption"] * 10
+
+        return attributes
 
 
     def set_preset_mode(self, preset_mode):
         """Activate a preset."""
+        if self._is_wall_unit:
+            if self.hvac_mode == HVACMode.FAN_ONLY and preset_mode == PRESET_ECONO:
+                _LOGGER.debug("Econo mode not supported in fan-only mode.")
+                return
+            if preset_mode == self.preset_mode:
+                return
+            if preset_mode == PRESET_ECONO:
+                self.data.daikinskyport.set_econo_mode(self.thermostat_index, True)
+                self.data.daikinskyport.set_boost_mode(self.thermostat_index, False)
+            elif preset_mode == PRESET_BOOST:
+                self.data.daikinskyport.set_boost_mode(self.thermostat_index, True)
+                self.data.daikinskyport.set_econo_mode(self.thermostat_index, False)
+            elif preset_mode == PRESET_NONE:
+                self.data.daikinskyport.set_boost_mode(self.thermostat_index, False)
+                self.data.daikinskyport.set_econo_mode(self.thermostat_index, False)
+            else:
+                return
+            self._preset_mode = preset_mode
+            self.update_without_throttle = True
+            return
         if preset_mode == self.preset_mode:
             return
 
@@ -655,6 +927,8 @@ class Thermostat(ClimateEntity):
     @property
     def preset_modes(self):
         """Return available preset modes."""
+        if self._is_wall_unit and self.hvac_mode == HVACMode.FAN_ONLY:
+            return [mode for mode in self._preset_modes if mode != PRESET_ECONO]
         return list(self._preset_modes)
 
     def set_auto_temp_hold(self, heat_temp, cool_temp):
@@ -698,6 +972,32 @@ class Thermostat(ClimateEntity):
 
     def set_fan_mode(self, fan_mode):
         """Set the fan mode.  Valid values are "on", "auto", or "schedule"."""
+        if self._is_wall_unit and self._is_dry_mode():
+            _LOGGER.debug("Fan mode is not supported in dry mode.")
+            return
+        if self._is_wall_unit:
+            if isinstance(fan_mode, str) and fan_mode in WALL_UNIT_FAN_SPEED_FROM_HASS:
+                fan_speed = WALL_UNIT_FAN_SPEED_FROM_HASS[fan_mode]
+            else:
+                try:
+                    fan_speed = int(fan_mode)
+                except (TypeError, ValueError):
+                    _LOGGER.error("Invalid wall unit fan speed: %s", fan_mode)
+                    return
+            hvac_mode = self.hvac_mode
+            if hvac_mode == HVACMode.OFF:
+                hvac_mode = self._wall_unit_operating_mode() or HVACMode.AUTO
+            if hvac_mode == HVACMode.FAN_ONLY:
+                daikin_mode = WALL_UNIT_FAN_MODE_DEFAULT
+            else:
+                daikin_mode = self._daikin_mode_from_hass(hvac_mode)
+            self.data.daikinskyport.set_wall_unit_fan_speed(
+                self.thermostat_index, fan_speed, daikin_mode
+            )
+            self._fan_mode = str(fan_speed)
+            self.update_without_throttle = True
+            _LOGGER.debug("Setting wall unit fan speed to: %s", fan_speed)
+            return
         if fan_mode in {FAN_ON, FAN_AUTO, FAN_SCHEDULE}:
             self.data.daikinskyport.set_fan_mode(
                 self.thermostat_index,
@@ -750,6 +1050,28 @@ class Thermostat(ClimateEntity):
 
     def set_temperature(self, **kwargs):
         """Set new target temperature."""
+        if self._is_wall_unit and self._is_dry_mode():
+            _LOGGER.debug("Temperature control is not supported in dry mode.")
+            return
+        if self._is_wall_unit:
+            temp = kwargs.get(ATTR_TEMPERATURE)
+            if temp is None:
+                temp = kwargs.get(ATTR_TARGET_TEMP_HIGH) or kwargs.get(ATTR_TARGET_TEMP_LOW)
+            if temp is None:
+                _LOGGER.error("Missing temperature for wall unit set_temperature in %s", kwargs)
+                return
+            daikin_mode = self._daikin_mode_from_hass(self.hvac_mode)
+            self.data.daikinskyport.set_wall_unit_temperature(
+                self.thermostat_index, temp, daikin_mode
+            )
+            self._target_temp = temp
+            if self.hvac_mode == HVACMode.HEAT:
+                self._heat_setpoint = temp
+            elif self.hvac_mode == HVACMode.COOL:
+                self._cool_setpoint = temp
+            self.update_without_throttle = True
+            return
+
         low_temp = kwargs.get(ATTR_TARGET_TEMP_LOW)
         high_temp = kwargs.get(ATTR_TARGET_TEMP_HIGH)
         temp = kwargs.get(ATTR_TEMPERATURE)
@@ -773,13 +1095,14 @@ class Thermostat(ClimateEntity):
 
     def set_hvac_mode(self, hvac_mode):
         """Set HVAC mode (auto, auxHeatOnly, cool, heat, off)."""
-        daikin_value = next(
-            (k for k, v in DAIKIN_HVAC_TO_HASS.items() if v == hvac_mode), None
-        )
-        if daikin_value is None:
-            _LOGGER.error("Invalid mode for set_hvac_mode: %s", hvac_mode)
-            return
-        self.data.daikinskyport.set_hvac_mode(self.thermostat_index, daikin_value)
+        if self._is_wall_unit:
+            self.data.daikinskyport.set_wall_unit_mode(self.thermostat_index, hvac_mode)
+        else:
+            daikin_value = self._daikin_mode_from_hass(hvac_mode)
+            if daikin_value is None:
+                _LOGGER.error("Invalid mode for set_hvac_mode: %s", hvac_mode)
+                return
+            self.data.daikinskyport.set_hvac_mode(self.thermostat_index, daikin_value)
         self._hvac_mode = hvac_mode
         self.update_without_throttle = True
 
@@ -792,6 +1115,9 @@ class Thermostat(ClimateEntity):
 
     def set_fan_schedule(self, start=None, stop=None, interval=None, speed=None):
         """Set the thermostat fan schedule."""
+        if self._is_wall_unit:
+            _LOGGER.debug("Fan schedules are not supported for wall units.")
+            return
         if start is None:
             start = self.thermostat["fanCirculateStart"]
         if stop is None:
@@ -805,6 +1131,9 @@ class Thermostat(ClimateEntity):
 
     def set_night_mode(self, start=None, stop=None, enable=None):
         """Set the thermostat night mode."""
+        if self._is_wall_unit:
+            _LOGGER.debug("Night mode is not supported for wall units.")
+            return
         if start is None:
             start = self.thermostat["nightModeStart"]
         if stop is None:
@@ -818,6 +1147,9 @@ class Thermostat(ClimateEntity):
 
     def set_thermostat_schedule(self, day=None, start=None, part=None, enable=None, label=None, heating=None, cooling=None):
         """Set the thermostat schedule."""
+        if self._is_wall_unit:
+            _LOGGER.debug("Thermostat schedules are not supported for wall units.")
+            return
         if day is None:
             now = datetime.now()
             day = now.strftime("%a")
@@ -846,6 +1178,9 @@ class Thermostat(ClimateEntity):
 
     def set_oneclean(self, enable):
         """Enable/disable OneClean."""
+        if self._is_wall_unit:
+            _LOGGER.debug("OneClean is not supported for wall units.")
+            return
         self.data.daikinskyport.set_fan_clean(
             self.thermostat_index, enable
         )
@@ -853,6 +1188,9 @@ class Thermostat(ClimateEntity):
 
     def set_efficiency(self, enable):
         """Enable/disable heat pump efficiency."""
+        if self._is_wall_unit:
+            _LOGGER.debug("Efficiency mode is not supported for wall units.")
+            return
         self.data.daikinskyport.set_dual_fuel_efficiency(
             self.thermostat_index, enable
         )
@@ -860,7 +1198,7 @@ class Thermostat(ClimateEntity):
 
     def hold_preference(self):
         """Return user preference setting for hold time."""
-        default = self.thermostat["schedOverrideDuration"]
+        default = self.thermostat.get("schedOverrideDuration", HOLD_NEXT_TRANSITION)
         if isinstance(default, int):
             return default
         return HOLD_NEXT_TRANSITION
