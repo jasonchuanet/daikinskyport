@@ -417,6 +417,8 @@ class Thermostat(ClimateEntity):
     _attr_precision = PRECISION_TENTHS
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_fan_modes = [FAN_AUTO, FAN_ON, FAN_LOW, FAN_MEDIUM, FAN_HIGH, FAN_SCHEDULE]
+    _attr_min_humidity = 25
+    _attr_max_humidity = 65
     _attr_name = None
     _attr_has_entity_name = True
     _enable_turn_on_off_backwards_compatibility = False
@@ -432,6 +434,7 @@ class Thermostat(ClimateEntity):
         self._cool_setpoint = None
         self._heat_setpoint = None
         self._target_temp = None
+        self._attr_target_humidity = None
         self._hvac_mode = HVACMode.OFF
         self._fan_mode = None
         self._fan_speed = None
@@ -463,6 +466,8 @@ class Thermostat(ClimateEntity):
             self._fan_modes = []
         else:
             self._base_supported_features = SUPPORT_FLAGS
+            if self.thermostat.get("ctSystemCapHumidification", False):
+                self._base_supported_features |= ClimateEntityFeature.TARGET_HUMIDITY
             self._supported_features = self._base_supported_features
             self._attr_precision = PRECISION_TENTHS
             self._operation_list = []
@@ -559,6 +564,7 @@ class Thermostat(ClimateEntity):
         return self.thermostat.get(fan_key)
 
     def _apply_thermostat_state(self) -> None:
+        self._attr_target_humidity = self.thermostat.get("humSP")
         if self._is_wall_unit:
             self._hvac_mode = self._wall_unit_hvac_mode()
             self._cool_setpoint = self.thermostat.get("iduCoolSetpoint", self.thermostat.get("cspActive"))
@@ -1092,6 +1098,8 @@ class Thermostat(ClimateEntity):
     def set_humidity(self, humidity):
         """Set the humidity level."""
         self.data.daikinskyport.set_humidity(self.thermostat_index, humidity)
+        self._attr_target_humidity = humidity
+        self.update_without_throttle = True
 
     def set_hvac_mode(self, hvac_mode):
         """Set HVAC mode (auto, auxHeatOnly, cool, heat, off)."""
